@@ -1,6 +1,6 @@
 # YesNoMarket
 
-A decentralized prediction market platform built on **BNB Chain**, similar to Polymarket. Users can create markets, buy/sell shares, and resolve outcomes.
+A decentralized prediction market platform built on **BNB Chain**. Users can create markets, buy/sell shares, and resolve outcomes.
 
 ## 🌐 Built on BNB Chain
 
