@@ -1,0 +1,182 @@
+name: ControlGraph TRON voter census
+
+on:
+  push:
+    branches:
+      - controlgraph-data-exec-20260907
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tron-voters:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Crawl TRONSCAN public SR and voter endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p controlgraph_tron/raw
+          cat > /tmp/tron_crawl.py <<'PY'
+          import json, csv, time, urllib.parse, urllib.request, hashlib
+          from collections import defaultdict, Counter
+          from pathlib import Path
+
+          OUT=Path('controlgraph_tron'); RAW=OUT/'raw'; RAW.mkdir(parents=True,exist_ok=True)
+          BASES=['https://apilist.tronscanapi.com','https://apilist.tronscan.org','https://tronscanapi.com']
+          UA='Mozilla/5.0 ControlGraph-SIGMETRICS-repro/1.0'
+
+          def get_json(path, params, attempts=3):
+              qs=urllib.parse.urlencode(params)
+              errs=[]
+              for base in BASES:
+                  url=f'{base}{path}?{qs}'
+                  for i in range(attempts):
+                      try:
+                          req=urllib.request.Request(url,headers={'User-Agent':UA,'Accept':'application/json'})
+                          with urllib.request.urlopen(req,timeout=45) as r:
+                              data=r.read(); code=r.status
+                          obj=json.loads(data.decode('utf-8'))
+                          return obj,url,data
+                      except Exception as e:
+                          errs.append(f'{url}: {type(e).__name__}: {e}')
+                          time.sleep(1+i)
+              raise RuntimeError(' | '.join(errs[-6:]))
+
+          # Current active 27 SRs.
+          sr_obj,sr_url,sr_raw=get_json('/api/pagewitness',{'witnesstype':1,'start':0,'limit':100,'sort':'-votes'})
+          (RAW/'pagewitness.json').write_bytes(sr_raw)
+          data=sr_obj.get('data') or sr_obj.get('witnesses') or []
+          if not data:
+              raise SystemExit(f'No SR data. top-level keys={list(sr_obj)[:30]}')
+          # Filter active producer/top27 when fields available, then take rank order.
+          srs=[]
+          for x in data:
+              addr=x.get('address') or x.get('witnessAddress') or x.get('ownerAddress')
+              if not addr: continue
+              srs.append({
+                'address':addr,
+                'name':x.get('name') or x.get('url') or addr,
+                'votes':x.get('realTimeVotes') or x.get('votes') or 0,
+                'votesPercentage':x.get('votesPercentage'),
+                'ranking':x.get('ranking') or x.get('rank'),
+                'producer':x.get('producer'),
+                'witnessType':x.get('witnessType'),
+              })
+          srs=sorted(srs,key=lambda x:(x['ranking'] if isinstance(x['ranking'],int) else 9999, -int(x['votes'] or 0)))[:27]
+          if len(srs)<27: raise SystemExit(f'Only {len(srs)} SRs parsed')
+
+          with (OUT/'tron_active_27_sr.csv').open('w',newline='',encoding='utf-8') as f:
+              w=csv.DictWriter(f,fieldnames=list(srs[0].keys())); w.writeheader(); w.writerows(srs)
+
+          all_edges=[]; per_sr_summary=[]
+          page_size=200
+          for si,sr in enumerate(srs,1):
+              cand=sr['address']; start=0; pages=0; seen=0
+              total_reported=None; total_votes_reported=None
+              print(f'[{si:02d}/27] {sr["name"]} {cand}',flush=True)
+              while True:
+                  params={'candidate':cand,'start':start,'limit':page_size,'sort':'-votes','count':True}
+                  try:
+                      obj,url,raw=get_json('/api/vote',params)
+                  except Exception as e:
+                      # Persist a diagnostic for this SR and fail strict.
+                      (OUT/f'error_{cand}.txt').write_text(str(e),encoding='utf-8')
+                      raise
+                  pages+=1
+                  (RAW/f'vote_{cand}_{start}.json').write_bytes(raw)
+                  if total_reported is None:
+                      total_reported=obj.get('total')
+                      total_votes_reported=obj.get('totalVotes')
+                  rows=obj.get('data') or obj.get('votes') or []
+                  if not rows: break
+                  for r in rows:
+                      voter=r.get('voterAddress') or r.get('voter') or r.get('address')
+                      if not voter: continue
+                      votes=int(r.get('votes') or 0)
+                      all_edges.append({
+                        'candidate_address':cand,'candidate_name':sr['name'],
+                        'voter_address':voter,'voter_tag':r.get('voterAddressTag') or r.get('addressTag') or '',
+                        'votes':votes,'candidate_total_votes':r.get('candidateTotalVotes') or total_votes_reported or '',
+                        'voter_percentage':r.get('voterPercentage') or '',
+                        'percentage':r.get('percentage') or '',
+                        'source_url':url
+                      })
+                      seen+=1
+                  start += len(rows)
+                  if len(rows)<page_size: break
+                  if isinstance(total_reported,int) and start>=total_reported: break
+                  if pages>500: raise SystemExit(f'pagination runaway {cand}')
+              per_sr_summary.append({'candidate_address':cand,'candidate_name':sr['name'],'reported_voter_count':total_reported,'rows_crawled':seen,'pages':pages,'reported_total_votes':total_votes_reported})
+
+          if not all_edges: raise SystemExit('No voter edges returned')
+          edge_fields=list(all_edges[0].keys())
+          with (OUT/'tron_voter_sr_edges.csv').open('w',newline='',encoding='utf-8') as f:
+              w=csv.DictWriter(f,fieldnames=edge_fields); w.writeheader(); w.writerows(all_edges)
+          with (OUT/'tron_per_sr_voter_crawl_summary.csv').open('w',newline='',encoding='utf-8') as f:
+              w=csv.DictWriter(f,fieldnames=list(per_sr_summary[0].keys())); w.writeheader(); w.writerows(per_sr_summary)
+
+          # Aggregate exact by voter address across all 27 candidates.
+          agg=defaultdict(lambda:{'votes':0,'srs':set(),'tags':Counter()})
+          for e in all_edges:
+              a=agg[e['voter_address']]; a['votes']+=e['votes']; a['srs'].add(e['candidate_address'])
+              if e['voter_tag']: a['tags'][e['voter_tag']]+=e['votes']
+          total_edge_votes=sum(e['votes'] for e in all_edges)
+          voters=[]
+          for addr,a in agg.items():
+              tag=a['tags'].most_common(1)[0][0] if a['tags'] else ''
+              voters.append({'voter_address':addr,'public_tag':tag,'votes_across_active27':a['votes'],'share_of_crawled_vote_edges':a['votes']/total_edge_votes if total_edge_votes else 0,'active_srs_voted_for':len(a['srs'])})
+          voters.sort(key=lambda x:(-x['votes_across_active27'],x['voter_address']))
+          cum=0
+          for i,v in enumerate(voters,1):
+              cum += v['votes_across_active27']
+              v['rank']=i; v['cumulative_share']=cum/total_edge_votes if total_edge_votes else 0
+          voter_fields=['rank','voter_address','public_tag','votes_across_active27','share_of_crawled_vote_edges','cumulative_share','active_srs_voted_for']
+          with (OUT/'tron_voter_address_ranking.csv').open('w',newline='',encoding='utf-8') as f:
+              w=csv.DictWriter(f,fieldnames=voter_fields); w.writeheader(); w.writerows(voters)
+
+          mds_addr=next((v['rank'] for v in voters if v['cumulative_share']>=1/3),None)
+          top20=voters[:20]
+
+          # Conservative tag/entity grouping: only merge addresses sharing a non-empty explorer tag.
+          # Untagged addresses stay singleton; output is explicitly labelled "public-tag grouping", not beneficial ownership truth.
+          groups=defaultdict(lambda:{'votes':0,'addresses':set(),'srs':set()})
+          for e in all_edges:
+              key=(e['voter_tag'].strip() if e['voter_tag'].strip() else f'UNMAPPED::{e["voter_address"]}')
+              g=groups[key]; g['votes']+=e['votes']; g['addresses'].add(e['voter_address']); g['srs'].add(e['candidate_address'])
+          ents=[]
+          for key,g in groups.items():
+              ents.append({'entity_key':key,'public_tag_grouped':not key.startswith('UNMAPPED::'),'votes':g['votes'],'address_count':len(g['addresses']),'active_srs_voted_for':len(g['srs'])})
+          ents.sort(key=lambda x:(-x['votes'],x['entity_key']))
+          cum=0
+          for i,e in enumerate(ents,1):
+              cum+=e['votes']; e['rank']=i; e['share']=e['votes']/total_edge_votes; e['cumulative_share']=cum/total_edge_votes
+          ent_fields=['rank','entity_key','public_tag_grouped','votes','share','cumulative_share','address_count','active_srs_voted_for']
+          with (OUT/'tron_public_tag_entity_ranking.csv').open('w',newline='',encoding='utf-8') as f:
+              w=csv.DictWriter(f,fieldnames=ent_fields); w.writeheader(); w.writerows(ents)
+          mds_tag=next((e['rank'] for e in ents if e['cumulative_share']>=1/3),None)
+
+          summary={
+            'active_sr_count':len(srs),'voter_edge_rows':len(all_edges),'unique_voter_addresses':len(voters),
+            'total_votes_across_crawled_edges':total_edge_votes,'address_level_MDS_one_third':mds_addr,
+            'public_tag_grouped_MDS_one_third':mds_tag,'top20_voter_addresses':top20,
+            'public_tag_grouping_warning':'Explorer public tags are not sufficient evidence of beneficial ownership. Untagged addresses remain singleton; tagged grouping is a separate exploratory view.',
+            'source_sr_url':sr_url
+          }
+          (OUT/'tron_voter_census_summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
+          print(json.dumps(summary,indent=2))
+          PY
+          python /tmp/tron_crawl.py
+      - name: Upload TRON census outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: controlgraph-tron-voter-census-20260907
+          path: controlgraph_tron/
+          if-no-files-found: error
+          retention-days: 30
