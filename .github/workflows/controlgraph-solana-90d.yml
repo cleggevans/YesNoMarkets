@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - controlgraph-data-exec-20260907
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -23,7 +26,7 @@ jobs:
           set -euo pipefail
           mkdir -p controlgraph_sol90/raw
           cat > /tmp/run_sol90.py <<'PY'
-          import csv, io, json, hashlib, time, urllib.request, urllib.error
+          import csv, io, json, hashlib, time, urllib.request
           from collections import defaultdict, Counter
           from datetime import date, timedelta
           from pathlib import Path
@@ -66,7 +69,6 @@ jobs:
               x = (raw or '').strip()
               if x:
                   return PROVIDER_NORMALIZATION.get(x, x), True
-              # Never merge unrelated unmapped validators into one fake domain.
               ident = (row.get('VotePubkey') or row.get('NodePubkey') or row.get('IP') or 'row').strip()
               return f'UNMAPPED::{ident}', False
 
@@ -92,11 +94,9 @@ jobs:
 
               sha = hashlib.sha256(payload).hexdigest()
               hash_to_dates[sha].append(ds)
-              raw_path = RAW / f'solana_{ds}.csv'
-              raw_path.write_bytes(payload)
+              (RAW / f'solana_{ds}.csv').write_bytes(payload)
 
-              text = payload.decode('utf-8-sig')
-              reader = csv.DictReader(io.StringIO(text))
+              reader = csv.DictReader(io.StringIO(payload.decode('utf-8-sig')))
               provider_stake = defaultdict(int)
               total_stake = 0
               mapped_stake = 0
@@ -124,21 +124,19 @@ jobs:
 
               ranked = sorted(provider_stake.items(), key=lambda kv:(-kv[1], kv[0]))
               cumulative = 0
-              curve = []
+              mds = None
               for rank, (provider, stake) in enumerate(ranked, 1):
                   cumulative += stake
-                  curve.append((rank, provider, stake, cumulative/total_stake))
+                  if cumulative / total_stake >= THRESHOLD:
+                      mds = rank
+                      break
+              assert mds is not None
 
-              e = {}
-              for k in (1,2,3):
-                  e[k] = sum(stake for _, stake in ranked[:k]) / total_stake
-              mds = next(rank for rank, _, _, cum_share in curve if cum_share >= THRESHOLD)
+              e1 = sum(stake for _, stake in ranked[:1]) / total_stake
+              e2 = sum(stake for _, stake in ranked[:2]) / total_stake
+              e3 = sum(stake for _, stake in ranked[:3]) / total_stake
               witness = [p for p,_ in ranked[:mds]]
-
-              top10 = [
-                  {'rank':i+1,'provider':p,'stake_lamports':s,'stake_share':s/total_stake}
-                  for i,(p,s) in enumerate(ranked[:10])
-              ]
+              top10 = [{'rank':i+1,'provider':p,'stake_lamports':s,'stake_share':s/total_stake} for i,(p,s) in enumerate(ranked[:10])]
 
               status = 'observed'
               note = ''
@@ -147,38 +145,22 @@ jobs:
                   note = 'Source release states this snapshot is a copy of date-2026-07-01.'
 
               results.append({
-                  'date': ds,
-                  'source_url': url,
-                  'sha256': sha,
-                  'status': status,
-                  'source_note': note,
-                  'rows': valid_rows,
-                  'unmapped_rows': unmapped_rows,
-                  'total_active_stake_lamports': total_stake,
-                  'mapped_hosting_stake_lamports': mapped_stake,
-                  'hosting_observability_coverage': mapped_stake/total_stake,
-                  'top_provider': ranked[0][0],
-                  'top_provider_share': ranked[0][1]/total_stake,
-                  'second_provider': ranked[1][0] if len(ranked)>1 else '',
-                  'second_provider_share': ranked[1][1]/total_stake if len(ranked)>1 else 0,
-                  'third_provider': ranked[2][0] if len(ranked)>2 else '',
-                  'third_provider_share': ranked[2][1]/total_stake if len(ranked)>2 else 0,
-                  'E_L_1': e[1],
-                  'E_L_2': e[2],
-                  'E_L_3': e[3],
-                  'MDS_L_one_third': mds,
-                  'MDS_witness': witness,
-                  'top10': top10,
+                  'date': ds,'source_url': url,'sha256': sha,'status': status,'source_note': note,
+                  'rows': valid_rows,'unmapped_rows': unmapped_rows,'total_active_stake_lamports': total_stake,
+                  'mapped_hosting_stake_lamports': mapped_stake,'hosting_observability_coverage': mapped_stake/total_stake,
+                  'top_provider': ranked[0][0],'top_provider_share': ranked[0][1]/total_stake,
+                  'second_provider': ranked[1][0],'second_provider_share': ranked[1][1]/total_stake,
+                  'third_provider': ranked[2][0],'third_provider_share': ranked[2][1]/total_stake,
+                  'E_L_1': e1,'E_L_2': e2,'E_L_3': e3,'MDS_L_one_third': mds,
+                  'MDS_witness': witness,'top10': top10,
               })
 
-          # Strict research gate: require every day.
           if missing:
               (OUT/'solana_90d_missing.json').write_text(json.dumps(missing, indent=2), encoding='utf-8')
               raise SystemExit(f'STRICT FAILURE: missing {len(missing)} days')
           if len(results) != 90:
               raise SystemExit(f'STRICT FAILURE: got {len(results)} results')
 
-          # Mark duplicate payloads after all hashes are known.
           duplicates = {h:ds for h,ds in hash_to_dates.items() if len(ds)>1}
           for r in results:
               peers = duplicates.get(r['sha256'], [])
@@ -187,43 +169,27 @@ jobs:
                   r['status'] = 'duplicate'
                   r['source_note'] = f'Byte-identical payload shared with: {", ".join(peers)}'
 
-          # Temporal deltas and transitions.
           prev = None
           transitions = []
           for r in results:
               if prev is None:
-                  r['delta_E_L_1'] = None
-                  r['delta_E_L_2'] = None
-                  r['delta_E_L_3'] = None
+                  r['delta_E_L_1'] = r['delta_E_L_2'] = r['delta_E_L_3'] = None
                   r['MDS_transition'] = ''
               else:
                   r['delta_E_L_1'] = r['E_L_1'] - prev['E_L_1']
                   r['delta_E_L_2'] = r['E_L_2'] - prev['E_L_2']
                   r['delta_E_L_3'] = r['E_L_3'] - prev['E_L_3']
                   if r['MDS_L_one_third'] != prev['MDS_L_one_third']:
-                      tr = {
-                          'date':r['date'],
-                          'from':prev['MDS_L_one_third'],
-                          'to':r['MDS_L_one_third'],
-                          'previous_date':prev['date']
-                      }
+                      tr = {'date':r['date'],'previous_date':prev['date'],'from':prev['MDS_L_one_third'],'to':r['MDS_L_one_third']}
                       transitions.append(tr)
                       r['MDS_transition'] = f"{tr['from']}->{tr['to']}"
                   else:
                       r['MDS_transition'] = ''
               prev = r
 
-          fields = [
-              'date','status','source_note','source_url','sha256','rows','unmapped_rows',
-              'total_active_stake_lamports','hosting_observability_coverage',
-              'top_provider','top_provider_share','second_provider','second_provider_share',
-              'third_provider','third_provider_share','E_L_1','E_L_2','E_L_3',
-              'MDS_L_one_third','MDS_witness','duplicate_dates',
-              'delta_E_L_1','delta_E_L_2','delta_E_L_3','MDS_transition'
-          ]
+          fields = ['date','status','source_note','source_url','sha256','rows','unmapped_rows','total_active_stake_lamports','hosting_observability_coverage','top_provider','top_provider_share','second_provider','second_provider_share','third_provider','third_provider_share','E_L_1','E_L_2','E_L_3','MDS_L_one_third','MDS_witness','duplicate_dates','delta_E_L_1','delta_E_L_2','delta_E_L_3','MDS_transition']
           with (OUT/'solana_90d_results.csv').open('w', newline='', encoding='utf-8') as f:
-              w = csv.DictWriter(f, fieldnames=fields)
-              w.writeheader()
+              w = csv.DictWriter(f, fieldnames=fields); w.writeheader()
               for r in results:
                   row = {k:r.get(k) for k in fields}
                   row['MDS_witness'] = '|'.join(r['MDS_witness'])
@@ -231,39 +197,25 @@ jobs:
                   w.writerow(row)
 
           (OUT/'solana_90d_results.json').write_text(json.dumps(results, indent=2), encoding='utf-8')
-
           mds_counts = Counter(r['MDS_L_one_third'] for r in results)
-          e1 = [r['E_L_1'] for r in results]
-          e2 = [r['E_L_2'] for r in results]
-          e3 = [r['E_L_3'] for r in results]
-          coverage = [r['hosting_observability_coverage'] for r in results]
-          moves = sorted(
-              [r for r in results if r['delta_E_L_1'] is not None],
-              key=lambda r: abs(r['delta_E_L_1']), reverse=True
-          )[:10]
-          summary = {
-              'window_start':days[0], 'window_end':days[-1], 'calendar_days':len(days),
-              'complete':len(results)==90 and not missing,
-              'threshold':THRESHOLD,
+          e1=[r['E_L_1'] for r in results]; e2=[r['E_L_2'] for r in results]; e3=[r['E_L_3'] for r in results]
+          cov=[r['hosting_observability_coverage'] for r in results]
+          moves=sorted([r for r in results if r['delta_E_L_1'] is not None], key=lambda r:abs(r['delta_E_L_1']), reverse=True)[:10]
+          summary={
+              'window_start':days[0],'window_end':days[-1],'calendar_days':90,'complete':True,'threshold':THRESHOLD,
               'status_counts':dict(Counter(r['status'] for r in results)),
               'mds_counts':{str(k):v for k,v in sorted(mds_counts.items())},
-              'mds_transitions':transitions,
-              'duplicate_payload_groups':duplicates,
-              'E_L_1':{'min':min(e1),'max':max(e1),'mean':sum(e1)/len(e1)},
-              'E_L_2':{'min':min(e2),'max':max(e2),'mean':sum(e2)/len(e2)},
-              'E_L_3':{'min':min(e3),'max':max(e3),'mean':sum(e3)/len(e3)},
-              'hosting_observability_coverage':{'min':min(coverage),'max':max(coverage),'mean':sum(coverage)/len(coverage)},
-              'largest_abs_daily_E1_moves':[{
-                  'date':r['date'],'delta_E_L_1':r['delta_E_L_1'],
-                  'E_L_1':r['E_L_1'],'top_provider':r['top_provider']
-              } for r in moves],
+              'mds_transitions':transitions,'duplicate_payload_groups':duplicates,
+              'E_L_1':{'min':min(e1),'max':max(e1),'mean':sum(e1)/90},
+              'E_L_2':{'min':min(e2),'max':max(e2),'mean':sum(e2)/90},
+              'E_L_3':{'min':min(e3),'max':max(e3),'mean':sum(e3)/90},
+              'hosting_observability_coverage':{'min':min(cov),'max':max(cov),'mean':sum(cov)/90},
+              'largest_abs_daily_E1_moves':[{'date':r['date'],'delta_E_L_1':r['delta_E_L_1'],'E_L_1':r['E_L_1'],'top_provider':r['top_provider']} for r in moves]
           }
           (OUT/'solana_90d_summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
-
           with (OUT/'raw_hashes.csv').open('w', newline='', encoding='utf-8') as f:
               w=csv.writer(f); w.writerow(['date','sha256','source_url'])
               for r in results: w.writerow([r['date'],r['sha256'],r['source_url']])
-
           print(json.dumps(summary, indent=2))
           PY
           python /tmp/run_sol90.py
