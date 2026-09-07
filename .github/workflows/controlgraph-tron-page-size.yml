@@ -1,0 +1,79 @@
+name: ControlGraph TRON voter page-size diagnostic
+
+on:
+  push:
+    branches: [controlgraph-data-exec-20260907]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  page-size:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe large anonymous voter pages below rate limit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tron_page_diag
+          cat > /tmp/probe.py <<'PY'
+          import urllib.request, urllib.error, urllib.parse, json, time
+          from pathlib import Path
+          OUT=Path('tron_page_diag')
+          BASE='https://apilist.tronscanapi.com/api/vote'
+          CAND='TJvaAeFb8Lykt9RQcVyyTFN2iDvGMuyD4M'
+          limits=[200,500,1000,2000,5000]
+
+          def req(limit):
+              params={'candidate':CAND,'start':0,'limit':limit,'sort':'-votes'}
+              url=BASE+'?'+urllib.parse.urlencode(params)
+              request=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0 ControlGraph-SIGMETRICS','Accept':'application/json','Referer':'https://tronscan.org/'})
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(request,timeout=90) as r:
+                          body=r.read(); code=r.status; headers=dict(r.headers)
+                      return code,body,headers,url,''
+                  except urllib.error.HTTPError as e:
+                      body=e.read(); code=e.code; headers=dict(e.headers)
+                      if code==429 and attempt<2:
+                          time.sleep(125)
+                          continue
+                      return code,body,headers,url,str(e)
+                  except Exception as e:
+                      if attempt<2:
+                          time.sleep(5)
+                          continue
+                      return 0,b'',{},url,repr(e)
+
+          summary=[]
+          for i,lim in enumerate(limits):
+              if i: time.sleep(2.0)  # comfortably below anonymous 3 RPS
+              code,body,headers,url,err=req(lim)
+              text=body.decode('utf-8','replace')
+              parsed={}
+              try: parsed=json.loads(text)
+              except: pass
+              rows=(parsed.get('data') or []) if isinstance(parsed,dict) else []
+              rec={
+                  'requested_limit':lim,'http_status':code,'returned_rows':len(rows),
+                  'reported_total':parsed.get('total') if isinstance(parsed,dict) else None,
+                  'reported_totalVotes':parsed.get('totalVotes') if isinstance(parsed,dict) else None,
+                  'response_bytes':len(body),'error':err,'url':url,
+                  'message':parsed.get('message') if isinstance(parsed,dict) else text[:300]
+              }
+              summary.append(rec)
+              (OUT/f'limit_{lim}.json').write_bytes(body)
+              print(json.dumps(rec),flush=True)
+          (OUT/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
+          PY
+          python /tmp/probe.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: controlgraph-tron-page-size-diagnostic
+          path: tron_page_diag/
+          if-no-files-found: error
+          retention-days: 7
