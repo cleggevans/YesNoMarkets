@@ -1,0 +1,235 @@
+name: ControlGraph TRON certified Top-voter census
+
+on:
+  push:
+    branches: [controlgraph-data-exec-20260907]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  certified-top-voters:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build certified Top-voter ranking with unseen-address bounds
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p controlgraph_tron_cert/raw
+          cat > /tmp/tron_cert.py <<'PY'
+          import csv, json, time, urllib.parse, urllib.request, urllib.error, hashlib
+          from pathlib import Path
+          from collections import defaultdict, Counter
+
+          OUT=Path('controlgraph_tron_cert'); RAW=OUT/'raw'; RAW.mkdir(parents=True,exist_ok=True)
+          BASE='https://apilist.tronscanapi.com'
+          UA='Mozilla/5.0 ControlGraph-SIGMETRICS-repro/1.0'
+          PAGE=50
+          SLEEP=0.65   # < 2 RPS, below anonymous 3 RPS
+
+          last_req=0.0
+          def get_json(path, params, label):
+              global last_req
+              url=BASE+path+'?'+urllib.parse.urlencode(params)
+              for attempt in range(6):
+                  delay=SLEEP-(time.time()-last_req)
+                  if delay>0: time.sleep(delay)
+                  req=urllib.request.Request(url,headers={'User-Agent':UA,'Accept':'application/json','Referer':'https://tronscan.org/'})
+                  try:
+                      last_req=time.time()
+                      with urllib.request.urlopen(req,timeout=60) as r:
+                          raw=r.read(); code=r.status
+                      obj=json.loads(raw.decode('utf-8'))
+                      (RAW/f'{label}.json').write_bytes(raw)
+                      return obj,url,raw
+                  except urllib.error.HTTPError as e:
+                      raw=e.read(); last_req=time.time()
+                      if e.code==429:
+                          print(f'429 on {label}; cooling 125s',flush=True)
+                          time.sleep(125)
+                          continue
+                      raise RuntimeError(f'{label} HTTP {e.code}: {raw[:300]!r}')
+                  except Exception as e:
+                      if attempt<5:
+                          time.sleep(min(20,2**attempt)); continue
+                      raise
+              raise RuntimeError(f'failed {label}')
+
+          # 1) Active SR set.
+          sr_obj,sr_url,sr_raw=get_json('/api/pagewitness',{'witnesstype':1,'start':0,'limit':50,'sort':'-votes'},'active27')
+          srdata=sr_obj.get('data') or []
+          active=[]
+          for x in srdata:
+              addr=x.get('address')
+              if not addr: continue
+              active.append({
+                  'address':addr,'name':x.get('name') or addr,
+                  'votes':int(x.get('realTimeVotes') or x.get('votes') or 0),
+                  'ranking':x.get('ranking'),'producer':x.get('producer'),'witnessType':x.get('witnessType')
+              })
+          active.sort(key=lambda x:(x['ranking'] if isinstance(x['ranking'],int) else 9999,-x['votes']))
+          active=active[:27]
+          if len(active)!=27: raise SystemExit(f'Expected 27 active SRs, got {len(active)}')
+          aset={x['address'] for x in active}
+          aname={x['address']:x['name'] for x in active}
+
+          # 2) Top-50 per candidate + exact denominator and boundary.
+          edges=[]; boundaries={}; candidate_totals={}; tags=defaultdict(Counter)
+          for i,sr in enumerate(active,1):
+              obj,url,raw=get_json('/api/vote',{'candidate':sr['address'],'start':0,'limit':PAGE,'sort':'-votes'},f'cand_{i:02d}_{sr["address"]}')
+              rows=obj.get('data') or []
+              if not rows: raise SystemExit(f'No voters for {sr["name"]}')
+              total_votes=int(obj.get('totalVotes') or sr['votes'] or 0)
+              candidate_totals[sr['address']]=total_votes
+              boundary=int(rows[-1].get('votes') or 0) if len(rows)==PAGE else 0
+              boundaries[sr['address']]=boundary
+              for r in rows:
+                  voter=r.get('voterAddress'); votes=int(r.get('votes') or 0)
+                  if not voter: continue
+                  tag=(r.get('voterAddressTag') or '').strip()
+                  if tag: tags[voter][tag]+=votes
+                  edges.append({'candidate_address':sr['address'],'candidate_name':sr['name'],'voter_address':voter,'voter_tag':tag,'votes':votes,'source_url':url})
+              print(f'candidate {i:02d}/27 {sr["name"]}: total={obj.get("total")} votes={total_votes} boundary50={boundary}',flush=True)
+
+          denominator=sum(candidate_totals.values())
+          if denominator<=0: raise SystemExit('zero denominator')
+
+          with (OUT/'tron_active27_candidate_totals.csv').open('w',newline='',encoding='utf-8') as f:
+              fields=['rank','candidate_name','candidate_address','total_votes','top50_boundary_votes']
+              w=csv.DictWriter(f,fieldnames=fields); w.writeheader()
+              for rank,sr in enumerate(active,1):
+                  w.writerow({'rank':rank,'candidate_name':sr['name'],'candidate_address':sr['address'],'total_votes':candidate_totals[sr['address']],'top50_boundary_votes':boundaries[sr['address']]})
+          with (OUT/'tron_candidate_top50_edges.csv').open('w',newline='',encoding='utf-8') as f:
+              fields=['candidate_address','candidate_name','voter_address','voter_tag','votes','source_url']
+              w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(edges)
+
+          # Observed contributions + per-address upper bound before exact voter query.
+          obs=defaultdict(int); seen_cands=defaultdict(set)
+          for e in edges:
+              obs[e['voter_address']]+=e['votes']; seen_cands[e['voter_address']].add(e['candidate_address'])
+          union=set(obs)
+          global_unseen_bound=sum(boundaries.values())  # address absent from every top50
+
+          def ub(addr):
+              # Exact observed top50 edges + below-boundary possible contributions in every candidate where absent.
+              return obs[addr] + sum(boundaries[c] for c in aset-seen_cands[addr])
+
+          # Query addresses adaptively in descending current upper bound.
+          exact={}; allocations={}; voter_query_total={}; queried_order=[]
+          cert_top_n=20
+          max_queries=min(600,len(union))
+
+          def query_voter(addr,qidx):
+              # TRON account voting targets are normally <=30, but paginate defensively if total > 50.
+              start=0; allrows=[]; total=None; pageidx=0
+              while True:
+                  pageidx+=1
+                  obj,url,raw=get_json('/api/vote',{'voter':addr,'start':start,'limit':PAGE,'sort':'-votes'},f'voter_{qidx:04d}_{pageidx}_{addr}')
+                  rows=obj.get('data') or []
+                  if total is None: total=obj.get('total')
+                  allrows.extend(rows)
+                  if len(rows)<PAGE: break
+                  start += len(rows)
+                  if isinstance(total,int) and start>=total: break
+                  if pageidx>20: raise RuntimeError(f'voter pagination runaway {addr}')
+              active_rows=[]; s=0
+              for r in allrows:
+                  cand=r.get('candidateAddress'); votes=int(r.get('votes') or 0)
+                  if cand in aset:
+                      s+=votes
+                      active_rows.append({'candidate_address':cand,'candidate_name':aname[cand],'votes':votes})
+                  tag=(r.get('voterAddressTag') or '').strip()
+                  if tag: tags[addr][tag]+=votes
+              return s,active_rows,total
+
+          for qidx in range(1,max_queries+1):
+              # Pick unqueried address with largest admissible upper bound.
+              candidates=[a for a in union if a not in exact]
+              if not candidates: break
+              addr=max(candidates,key=lambda a:(ub(a),obs[a],a))
+              total_active,active_rows,total=query_voter(addr,qidx)
+              exact[addr]=total_active; allocations[addr]=active_rows; voter_query_total[addr]=total; queried_order.append(addr)
+
+              if qidx%10==0 or qidx<=5:
+                  print(f'queried {qidx}: exact={total_active} obs={obs[addr]} ub_before={ub(addr)} {addr}',flush=True)
+
+              if len(exact)>=cert_top_n:
+                  ranked_exact=sorted(exact.items(),key=lambda kv:(-kv[1],kv[0]))
+                  nth=ranked_exact[cert_top_n-1][1]
+                  max_unqueried=max([global_unseen_bound]+[ub(a) for a in union if a not in exact])
+                  # If the 20th exact voter exceeds every possible unqueried voter, Top20 is certified exact.
+                  if nth>max_unqueried:
+                      cum=0; mds=None
+                      for rank,(a,v) in enumerate(ranked_exact,1):
+                          cum+=v
+                          if mds is None and cum/denominator>=1/3: mds=rank
+                      # If threshold crosses inside certified Top20, MDS is also exact.
+                      if mds is not None and mds<=cert_top_n:
+                          print(f'CERTIFIED after {qidx} voter queries: top20 stable, MDS={mds}, unseen_bound={max_unqueried}',flush=True)
+                          break
+          else:
+              print('Reached query cap without certification',flush=True)
+
+          ranked_exact=sorted(exact.items(),key=lambda kv:(-kv[1],kv[0]))
+          max_unqueried=max([global_unseen_bound]+[ub(a) for a in union if a not in exact])
+          top20_certified=(len(ranked_exact)>=20 and ranked_exact[19][1]>max_unqueried)
+          cum=0; rows_out=[]; mds=None
+          for rank,(addr,votes) in enumerate(ranked_exact,1):
+              cum+=votes
+              if mds is None and cum/denominator>=1/3: mds=rank
+              tag=tags[addr].most_common(1)[0][0] if tags[addr] else ''
+              rows_out.append({'rank':rank,'voter_address':addr,'public_tag':tag,'active27_votes':votes,'share_of_active27_votes':votes/denominator,'cumulative_share':cum/denominator,'observed_top50_votes':obs.get(addr,0),'prequery_upper_bound':ub(addr),'voted_active_srs':len(allocations.get(addr,[])),'voter_api_reported_targets':voter_query_total.get(addr)})
+
+          mds_exact=bool(top20_certified and mds is not None and mds<=20)
+          with (OUT/'tron_certified_voter_ranking.csv').open('w',newline='',encoding='utf-8') as f:
+              fields=['rank','voter_address','public_tag','active27_votes','share_of_active27_votes','cumulative_share','observed_top50_votes','prequery_upper_bound','voted_active_srs','voter_api_reported_targets']
+              w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(rows_out)
+
+          alloc_rows=[]
+          for addr,arr in allocations.items():
+              for r in arr: alloc_rows.append({'voter_address':addr,**r})
+          with (OUT/'tron_queried_voter_active27_allocations.csv').open('w',newline='',encoding='utf-8') as f:
+              fields=['voter_address','candidate_address','candidate_name','votes']; w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(alloc_rows)
+
+          # Conservative public-tag entity view over queried/certified addresses only.
+          # Untagged addresses remain singleton. We do NOT treat this as full beneficial-owner truth.
+          groups=defaultdict(lambda:{'votes':0,'addresses':[]})
+          for addr,votes in exact.items():
+              tag=tags[addr].most_common(1)[0][0] if tags[addr] else ''
+              key=f'TAG::{tag}' if tag else f'ADDRESS::{addr}'
+              groups[key]['votes']+=votes; groups[key]['addresses'].append(addr)
+          ents=[]
+          for key,g in groups.items():
+              ents.append({'entity_key':key,'public_tag_grouped':key.startswith('TAG::'),'votes':g['votes'],'share_of_active27_votes':g['votes']/denominator,'address_count':len(g['addresses']),'addresses':'|'.join(sorted(g['addresses']))})
+          ents.sort(key=lambda x:(-x['votes'],x['entity_key']))
+          ecum=0
+          for i,e in enumerate(ents,1): e['rank']=i; ecum+=e['votes']; e['cumulative_share']=ecum/denominator
+          with (OUT/'tron_public_tag_entity_view.csv').open('w',newline='',encoding='utf-8') as f:
+              fields=['rank','entity_key','public_tag_grouped','votes','share_of_active27_votes','cumulative_share','address_count','addresses']; w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(ents)
+
+          summary={
+              'snapshot_note':'TRONSCAN current-state crawl executed by GitHub Actions',
+              'active_sr_count':27,'candidate_total_votes_denominator':denominator,
+              'candidate_top50_edge_rows':len(edges),'candidate_top50_unique_voters':len(union),
+              'top50_global_unseen_address_upper_bound_votes':global_unseen_bound,
+              'queried_voter_addresses':len(exact),'max_unqueried_address_upper_bound_votes':max_unqueried,
+              'top20_certified_exact':top20_certified,'address_level_MDS_one_third':mds if mds_exact else None,
+              'address_level_MDS_one_third_certified_exact':mds_exact,
+              'address_level_MDS_candidate_if_not_certified':mds,
+              'top20':rows_out[:20],
+              'warning':'Public explorer tags are evidence labels, not proof of beneficial ownership. Entity view merges only identical non-empty public tags; untagged addresses remain singleton.'
+          }
+          (OUT/'tron_certified_voter_summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
+          print(json.dumps(summary,indent=2),flush=True)
+          PY
+          python /tmp/tron_cert.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: controlgraph-tron-certified-top-voters-20260907
+          path: controlgraph_tron_cert/
+          if-no-files-found: error
+          retention-days: 30
