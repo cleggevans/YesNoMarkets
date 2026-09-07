@@ -15,7 +15,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: Probe large anonymous voter pages below rate limit
+      - name: Probe anonymous voter page-size boundary below rate limit
         shell: bash
         run: |
           set -euo pipefail
@@ -26,7 +26,7 @@ jobs:
           OUT=Path('tron_page_diag')
           BASE='https://apilist.tronscanapi.com/api/vote'
           CAND='TJvaAeFb8Lykt9RQcVyyTFN2iDvGMuyD4M'
-          limits=[200,500,1000,2000,5000]
+          limits=[50,100,150,199]
 
           def req(limit):
               params={'candidate':CAND,'start':0,'limit':limit,'sort':'-votes'}
@@ -51,20 +51,14 @@ jobs:
 
           summary=[]
           for i,lim in enumerate(limits):
-              if i: time.sleep(2.0)  # comfortably below anonymous 3 RPS
+              if i: time.sleep(2.0)
               code,body,headers,url,err=req(lim)
               text=body.decode('utf-8','replace')
               parsed={}
               try: parsed=json.loads(text)
               except: pass
               rows=(parsed.get('data') or []) if isinstance(parsed,dict) else []
-              rec={
-                  'requested_limit':lim,'http_status':code,'returned_rows':len(rows),
-                  'reported_total':parsed.get('total') if isinstance(parsed,dict) else None,
-                  'reported_totalVotes':parsed.get('totalVotes') if isinstance(parsed,dict) else None,
-                  'response_bytes':len(body),'error':err,'url':url,
-                  'message':parsed.get('message') if isinstance(parsed,dict) else text[:300]
-              }
+              rec={'requested_limit':lim,'http_status':code,'returned_rows':len(rows),'reported_total':parsed.get('total') if isinstance(parsed,dict) else None,'reported_totalVotes':parsed.get('totalVotes') if isinstance(parsed,dict) else None,'response_bytes':len(body),'error':err,'url':url,'message':parsed.get('message') if isinstance(parsed,dict) else text[:300]}
               summary.append(rec)
               (OUT/f'limit_{lim}.json').write_bytes(body)
               print(json.dumps(rec),flush=True)
