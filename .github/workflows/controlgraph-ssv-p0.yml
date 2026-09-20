@@ -1,0 +1,22 @@
+name: ControlGraph SSV P0 Probe
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Probe SSV public API
+        run: python research/controlgraph_ssv_p0_probe.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: controlgraph-ssv-p0-probe
+          path: ssv_probe/
+          if-no-files-found: error
